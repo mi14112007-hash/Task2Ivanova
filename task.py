@@ -8,10 +8,10 @@ from collections import deque, defaultdict
 class CargoRepository:
     def __init__(self, repo_url):
         self.repo_url = repo_url.rstrip('/')
-        self.dependency_cache = {}  # Кэш зависимостей
+        self.dependency_cache = {}
+        self.reverse_dependency_cache = defaultdict(list)  # Кэш обратных зависимостей
     
     def get_package_dependencies(self, package, version):
-        """Получение зависимостей пакета из тестового файла"""
         cache_key = f"{package}@{version}" if version else package
         
         if cache_key in self.dependency_cache:
@@ -24,10 +24,32 @@ class CargoRepository:
             deps = self._parse_cargo_dependencies(package, version)
         
         self.dependency_cache[cache_key] = deps
+        
+        # Обновляем кэш обратных зависимостей
+        for dep in deps:
+            self.reverse_dependency_cache[dep].append(package)
+        
         return deps
     
-    def _parse_test_file(self, filepath, package, version):
-        """Парсинг тестового файла с зависимостями"""
+    def get_reverse_dependencies(self, package):
+        """Получение обратных зависимостей (пакетов, зависящих от данного)"""
+        if package in self.reverse_dependency_cache:
+            return self.reverse_dependency_cache[package]
+        
+        # Если кэш пуст, строим его
+        if not self.reverse_dependency_cache:
+            self._build_reverse_dependency_cache()
+        
+        return self.reverse_dependency_cache.get(package, [])
+    
+    def _build_reverse_dependency_cache(self):
+        """Построение кэша обратных зависимостей"""
+        if self.repo_url.startswith('file://'):
+            filepath = self.repo_url[7:]
+            self._build_reverse_cache_from_file(filepath)
+    
+    def _build_reverse_cache_from_file(self, filepath):
+        """Построение кэша обратных зависимостей из файла"""
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -36,16 +58,35 @@ class CargoRepository:
                         parts = line.split('->')
                         pkg_info = parts[0].strip()
                         
-                        # Разделяем имя пакета и версию
+                        if '@' in pkg_info:
+                            pkg_name, _ = pkg_info.split('@')
+                        else:
+                            pkg_name = pkg_info
+                        
+                        deps = [p.strip() for p in parts[1].split(',')]
+                        clean_deps = [d.split('@')[0] for d in deps if d.strip()]
+                        
+                        for dep in clean_deps:
+                            self.reverse_dependency_cache[dep].append(pkg_name)
+        except Exception as e:
+            print(f"Ошибка построения кэша обратных зависимостей: {e}")
+    
+    def _parse_test_file(self, filepath, package, version):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and '->' in line:
+                        parts = line.split('->')
+                        pkg_info = parts[0].strip()
+                        
                         if '@' in pkg_info:
                             pkg_name, pkg_ver = pkg_info.split('@')
                         else:
                             pkg_name, pkg_ver = pkg_info, ''
                         
-                        # Проверяем соответствие пакета и версии
                         if pkg_name == package and (not version or pkg_ver == version):
                             deps = [p.strip() for p in parts[1].split(',')]
-                            # Убираем версии для чистоты вывода
                             clean_deps = [d.split('@')[0] for d in deps if d.strip()]
                             return clean_deps
         except FileNotFoundError:
@@ -56,7 +97,6 @@ class CargoRepository:
         return []
     
     def _parse_cargo_dependencies(self, package, version):
-        """Заглушка для реального Cargo репозитория"""
         demo_dependencies = {
             'serde': ['serde_derive', 'serde_json'],
             'serde_derive': ['proc-macro2', 'quote', 'syn'],
@@ -71,31 +111,26 @@ class CargoRepository:
         return demo_dependencies.get(package, [])
 
 class DependencyGraph:
-    """Класс для работы с графом зависимостей"""
-    
     def __init__(self, repository):
         self.repository = repository
         self.graph = defaultdict(list)
         self.visited = set()
         self.cycles = []
+        self.load_order = []  # Порядок загрузки зависимостей
     
     def build_graph_bfs_recursive(self, start_package, start_version="", max_depth=float('inf'), 
                                  exclude_substring="", current_depth=0, path=None):
-        """Построение графа зависимостей с помощью BFS с рекурсией"""
         if path is None:
             path = []
         
-        # Проверка максимальной глубины
         if current_depth >= max_depth:
             return
         
-        # Проверка циклических зависимостей
         if start_package in path:
             cycle = path[path.index(start_package):] + [start_package]
             self.cycles.append(cycle)
             return
         
-        # Пропускаем пакеты с исключаемой подстрокой
         if exclude_substring and exclude_substring in start_package:
             return
         
@@ -103,32 +138,57 @@ class DependencyGraph:
             return
         
         self.visited.add(start_package)
+        self.load_order.append(start_package)  # Добавляем в порядок загрузки
         current_path = path + [start_package]
         
-        # Получаем зависимости
         dependencies = self.repository.get_package_dependencies(start_package, start_version)
         
         for dep in dependencies:
             self.graph[start_package].append(dep)
-            # Рекурсивный вызов для зависимостей
             self.build_graph_bfs_recursive(
                 dep, "", max_depth, exclude_substring, 
                 current_depth + 1, current_path
             )
     
+    def get_load_order(self):
+        """Получение порядка загрузки зависимостей"""
+        return self.load_order
+    
+    def get_reverse_dependencies(self, package, max_depth=float('inf')):
+        """Получение обратных зависимостей с использованием BFS"""
+        reverse_deps = set()
+        visited = set()
+        queue = deque([(package, 0)])  # (package, depth)
+        
+        while queue:
+            current_pkg, depth = queue.popleft()
+            
+            if depth >= max_depth or current_pkg in visited:
+                continue
+            
+            visited.add(current_pkg)
+            
+            # Получаем пакеты, которые зависят от текущего
+            dependents = self.repository.get_reverse_dependencies(current_pkg)
+            
+            for dependent in dependents:
+                if dependent not in visited:
+                    reverse_deps.add(dependent)
+                    queue.append((dependent, depth + 1))
+        
+        return list(reverse_deps)
+    
     def get_graph(self):
-        """Получение построенного графа"""
         return dict(self.graph)
     
     def get_cycles(self):
-        """Получение найденных циклических зависимостей"""
         return self.cycles
     
     def reset(self):
-        """Сброс состояния графа"""
         self.graph.clear()
         self.visited.clear()
         self.cycles.clear()
+        self.load_order.clear()
 
 def run_stage1(config_path):
     """Выполнение этапа 1"""
@@ -296,6 +356,67 @@ def run_stage3(config_path):
     
     return 0
 
+def run_stage4(config_path):
+    """Выполнение этапа 4"""
+    print("=== ЭТАП 4: ДОПОЛНИТЕЛЬНЫЕ ОПЕРАЦИИ ===")
+    
+    # 1. Чтение конфигурации
+    if not os.path.exists(config_path):
+        print(f"Ошибка: файл {config_path} не найден")
+        return 1
+    
+    config = configparser.ConfigParser()
+    try:
+        config.read(config_path)
+    except Exception as e:
+        print(f"Ошибка чтения конфигурации: {e}")
+        return 1
+    
+    if 'DEFAULT' not in config:
+        print("Ошибка: не найден раздел [DEFAULT]")
+        return 1
+    
+    config_dict = dict(config['DEFAULT'])
+    
+    # 2. Извлечение параметров
+    package = config_dict.get('package_name', 'serde')
+    repo_url = config_dict.get('repository_url', 'file://test_repo.txt')
+    version = config_dict.get('package_version', '1.0')
+    max_depth = int(config_dict.get('max_depth', 0)) or float('inf')
+    
+    print(f"Анализ зависимостей для {package} версии {version}")
+    
+    # 3. Построение графа для получения порядка загрузки
+    repo = CargoRepository(repo_url)
+    graph_builder = DependencyGraph(repo)
+    
+    graph_builder.build_graph_bfs_recursive(package, version, max_depth)
+    
+    # 4. Порядок загрузки зависимостей
+    load_order = graph_builder.get_load_order()
+    print(f"\nПорядок загрузки зависимостей для {package}:")
+    for i, pkg in enumerate(load_order, 1):
+        print(f"  {i}. {pkg}")
+    
+    # 5. Обратные зависимости
+    reverse_deps = graph_builder.get_reverse_dependencies(package)
+    print(f"\nОбратные зависимости для {package} (пакеты, зависящие от него):")
+    if reverse_deps:
+        for dep in reverse_deps:
+            print(f"  - {dep}")
+    else:
+        print("  Обратные зависимости не найдены")
+    
+    # 6. Сравнение с реальным менеджером пакетов
+    print(f"\nСравнение с реальным менеджером пакетов Cargo:")
+    print("  Порядок загрузки может отличаться из-за:")
+    print("  - Оптимизации параллельной загрузки в Cargo")
+    print("  - Особенностей разрешения версий зависимостей")
+    print("  - Наличия опциональных зависимостей")
+    print("  - Кэширования ранее скачанных пакетов")
+    
+    return 0
+
 def main():
     parser = argparse.ArgumentParser(description='Визуализатор графа зависимостей')
     parser.add_argument('--config', required=True, help='Путь к INI-файлу конфигурации')
@@ -308,6 +429,8 @@ def main():
         return run_stage2(args.config)
     elif args.stage == 3:
         return run_stage3(args.config)
+    elif args.stage == 4:
+        return run_stage4(args.config)
     else:
         print(f"Этап {args.stage} еще не реализован")
         return 1

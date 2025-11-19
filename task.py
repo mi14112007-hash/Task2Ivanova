@@ -3,13 +3,15 @@ import configparser
 import argparse
 import sys
 import os
+import subprocess
+import tempfile
 from collections import deque, defaultdict
 
 class CargoRepository:
     def __init__(self, repo_url):
         self.repo_url = repo_url.rstrip('/')
         self.dependency_cache = {}
-        self.reverse_dependency_cache = defaultdict(list)  # Кэш обратных зависимостей
+        self.reverse_dependency_cache = defaultdict(list)
     
     def get_package_dependencies(self, package, version):
         cache_key = f"{package}@{version}" if version else package
@@ -25,31 +27,26 @@ class CargoRepository:
         
         self.dependency_cache[cache_key] = deps
         
-        # Обновляем кэш обратных зависимостей
         for dep in deps:
             self.reverse_dependency_cache[dep].append(package)
         
         return deps
     
     def get_reverse_dependencies(self, package):
-        """Получение обратных зависимостей (пакетов, зависящих от данного)"""
         if package in self.reverse_dependency_cache:
             return self.reverse_dependency_cache[package]
         
-        # Если кэш пуст, строим его
         if not self.reverse_dependency_cache:
             self._build_reverse_dependency_cache()
         
         return self.reverse_dependency_cache.get(package, [])
     
     def _build_reverse_dependency_cache(self):
-        """Построение кэша обратных зависимостей"""
         if self.repo_url.startswith('file://'):
             filepath = self.repo_url[7:]
             self._build_reverse_cache_from_file(filepath)
     
     def _build_reverse_cache_from_file(self, filepath):
-        """Построение кэша обратных зависимостей из файла"""
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -106,7 +103,14 @@ class CargoRepository:
             'quote': ['proc-macro2'],
             'itoa': [],
             'ryu': [],
-            'unicode-xid': []
+            'unicode-xid': [],
+            'tokio': ['futures', 'mio', 'num_cpus'],
+            'futures': [],
+            'mio': [],
+            'num_cpus': [],
+            'reqwest': ['futures', 'http', 'url', 'serde'],
+            'http': [],
+            'url': []
         }
         return demo_dependencies.get(package, [])
 
@@ -116,7 +120,7 @@ class DependencyGraph:
         self.graph = defaultdict(list)
         self.visited = set()
         self.cycles = []
-        self.load_order = []  # Порядок загрузки зависимостей
+        self.load_order = []
     
     def build_graph_bfs_recursive(self, start_package, start_version="", max_depth=float('inf'), 
                                  exclude_substring="", current_depth=0, path=None):
@@ -138,7 +142,7 @@ class DependencyGraph:
             return
         
         self.visited.add(start_package)
-        self.load_order.append(start_package)  # Добавляем в порядок загрузки
+        self.load_order.append(start_package)
         current_path = path + [start_package]
         
         dependencies = self.repository.get_package_dependencies(start_package, start_version)
@@ -150,15 +154,75 @@ class DependencyGraph:
                 current_depth + 1, current_path
             )
     
+    def generate_graphviz_dot(self):
+        """Генерация представления графа на языке Graphviz DOT"""
+        dot_lines = ["digraph Dependencies {"]
+        dot_lines.append("  rankdir=TB;")
+        dot_lines.append("  node [shape=box, style=filled, fillcolor=lightblue];")
+        dot_lines.append("  edge [color=darkgreen];")
+        
+        # Добавляем узлы и ребра
+        for source, targets in self.graph.items():
+            for target in targets:
+                dot_lines.append(f'  "{source}" -> "{target}";')
+        
+        # Выделяем циклические зависимости красным цветом
+        if self.cycles:
+            dot_lines.append("  edge [color=red];")
+            for cycle in self.cycles:
+                for i in range(len(cycle) - 1):
+                    dot_lines.append(f'  "{cycle[i]}" -> "{cycle[i+1]}";')
+        
+        dot_lines.append("}")
+        return "\n".join(dot_lines)
+    
+    def display_graph(self):
+        """Вывод графа на экран"""
+        dot_content = self.generate_graphviz_dot()
+        print("Граф зависимостей в формате Graphviz DOT:")
+        print(dot_content)
+        return dot_content
+    
+    def save_graph_image(self, filename):
+        """Сохранение графа в файл изображения"""
+        try:
+            dot_content = self.generate_graphviz_dot()
+            
+            # Создаем временный файл .dot
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.dot', delete=False) as dot_file:
+                dot_file.write(dot_content)
+                dot_filename = dot_file.name
+            
+            # Конвертируем в PNG с помощью Graphviz
+            result = subprocess.run(
+                ['dot', '-Tpng', dot_filename, '-o', filename],
+                capture_output=True, text=True
+            )
+            
+            # Удаляем временный файл
+            os.unlink(dot_filename)
+            
+            if result.returncode == 0:
+                print(f"Изображение графа сохранено в файл: {filename}")
+                return True
+            else:
+                print(f"Ошибка генерации изображения: {result.stderr}")
+                return False
+                
+        except FileNotFoundError:
+            print("Ошибка: Graphviz не установлен. Установите его для генерации изображений.")
+            return False
+        except Exception as e:
+            print(f"Ошибка сохранения изображения: {e}")
+            return False
+    
     def get_load_order(self):
-        """Получение порядка загрузки зависимостей"""
         return self.load_order
     
     def get_reverse_dependencies(self, package, max_depth=float('inf')):
-        """Получение обратных зависимостей с использованием BFS"""
         reverse_deps = set()
         visited = set()
-        queue = deque([(package, 0)])  # (package, depth)
+        queue = deque([(package, 0)])
         
         while queue:
             current_pkg, depth = queue.popleft()
@@ -167,8 +231,6 @@ class DependencyGraph:
                 continue
             
             visited.add(current_pkg)
-            
-            # Получаем пакеты, которые зависят от текущего
             dependents = self.repository.get_reverse_dependencies(current_pkg)
             
             for dependent in dependents:
@@ -417,6 +479,73 @@ def run_stage4(config_path):
     
     return 0
 
+def run_stage5(config_path):
+    """Выполнение этапа 5"""
+    print("=== ЭТАП 5: ВИЗУАЛИЗАЦИЯ ===")
+    
+    # 1. Чтение конфигурации
+    if not os.path.exists(config_path):
+        print(f"Ошибка: файл {config_path} не найден")
+        return 1
+    
+    config = configparser.ConfigParser()
+    try:
+        config.read(config_path)
+    except Exception as e:
+        print(f"Ошибка чтения конфигурации: {e}")
+        return 1
+    
+    if 'DEFAULT' not in config:
+        print("Ошибка: не найден раздел [DEFAULT]")
+        return 1
+    
+    config_dict = dict(config['DEFAULT'])
+    
+    # 2. Извлечение параметров
+    package = config_dict.get('package_name', 'serde')
+    repo_url = config_dict.get('repository_url', 'file://test_repo.txt')
+    version = config_dict.get('package_version', '1.0')
+    max_depth = int(config_dict.get('max_depth', 0)) or float('inf')
+    exclude_substring = config_dict.get('exclude_substring', '')
+    
+    print(f"Визуализация графа зависимостей для {package} версии {version}")
+    
+    # 3. Демонстрация для трех различных пакетов
+    demo_packages = ['serde', 'tokio', 'reqwest']
+    
+    for demo_package in demo_packages:
+        print(f"\n--- Визуализация для пакета: {demo_package} ---")
+        
+        repo = CargoRepository(repo_url)
+        graph_builder = DependencyGraph(repo)
+        
+        graph_builder.build_graph_bfs_recursive(
+            demo_package, version, max_depth, exclude_substring
+        )
+        
+        # Вывод графа в формате Graphviz
+        graph_builder.display_graph()
+        
+        # Сохранение изображения
+        image_filename = f"{demo_package}_dependencies.png"
+        if graph_builder.save_graph_image(image_filename):
+            print(f"Изображение сохранено: {image_filename}")
+        else:
+            print("Не удалось сохранить изображение (требуется Graphviz)")
+        
+        print(f"Граф содержит {len(graph_builder.get_graph())} узлов")
+    
+    # 4. Сравнение с реальными инструментами
+    print(f"\nСравнение с штатными инструментами визуализации Cargo:")
+    print("  Отличия могут быть вызваны:")
+    print("  - Разными алгоритмами обхода графа")
+    print("  - Учетом feature flags в реальном Cargo")
+    print("  - Обработкой dev-dependencies и build-dependencies")
+    print("  - Разрешением конфликтов версий")
+    print("  - Учетом платформо-специфичных зависимостей")
+    
+    return 0
+
 def main():
     parser = argparse.ArgumentParser(description='Визуализатор графа зависимостей')
     parser.add_argument('--config', required=True, help='Путь к INI-файлу конфигурации')
@@ -431,6 +560,8 @@ def main():
         return run_stage3(args.config)
     elif args.stage == 4:
         return run_stage4(args.config)
+    elif args.stage == 5:
+        return run_stage5(args.config)
     else:
         print(f"Этап {args.stage} еще не реализован")
         return 1

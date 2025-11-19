@@ -3,17 +3,28 @@ import configparser
 import argparse
 import sys
 import os
+from collections import deque, defaultdict
 
 class CargoRepository:
     def __init__(self, repo_url):
         self.repo_url = repo_url.rstrip('/')
+        self.dependency_cache = {}  # Кэш зависимостей
     
     def get_package_dependencies(self, package, version):
         """Получение зависимостей пакета из тестового файла"""
+        cache_key = f"{package}@{version}" if version else package
+        
+        if cache_key in self.dependency_cache:
+            return self.dependency_cache[cache_key]
+        
         if self.repo_url.startswith('file://'):
             filepath = self.repo_url[7:]
-            return self._parse_test_file(filepath, package, version)
-        return []
+            deps = self._parse_test_file(filepath, package, version)
+        else:
+            deps = self._parse_cargo_dependencies(package, version)
+        
+        self.dependency_cache[cache_key] = deps
+        return deps
     
     def _parse_test_file(self, filepath, package, version):
         """Парсинг тестового файла с зависимостями"""
@@ -43,6 +54,81 @@ class CargoRepository:
             print(f"Ошибка чтения файла: {e}")
         
         return []
+    
+    def _parse_cargo_dependencies(self, package, version):
+        """Заглушка для реального Cargo репозитория"""
+        demo_dependencies = {
+            'serde': ['serde_derive', 'serde_json'],
+            'serde_derive': ['proc-macro2', 'quote', 'syn'],
+            'serde_json': ['itoa', 'ryu', 'serde'],
+            'proc-macro2': ['unicode-xid'],
+            'syn': ['proc-macro2', 'quote', 'unicode-xid'],
+            'quote': ['proc-macro2'],
+            'itoa': [],
+            'ryu': [],
+            'unicode-xid': []
+        }
+        return demo_dependencies.get(package, [])
+
+class DependencyGraph:
+    """Класс для работы с графом зависимостей"""
+    
+    def __init__(self, repository):
+        self.repository = repository
+        self.graph = defaultdict(list)
+        self.visited = set()
+        self.cycles = []
+    
+    def build_graph_bfs_recursive(self, start_package, start_version="", max_depth=float('inf'), 
+                                 exclude_substring="", current_depth=0, path=None):
+        """Построение графа зависимостей с помощью BFS с рекурсией"""
+        if path is None:
+            path = []
+        
+        # Проверка максимальной глубины
+        if current_depth >= max_depth:
+            return
+        
+        # Проверка циклических зависимостей
+        if start_package in path:
+            cycle = path[path.index(start_package):] + [start_package]
+            self.cycles.append(cycle)
+            return
+        
+        # Пропускаем пакеты с исключаемой подстрокой
+        if exclude_substring and exclude_substring in start_package:
+            return
+        
+        if start_package in self.visited:
+            return
+        
+        self.visited.add(start_package)
+        current_path = path + [start_package]
+        
+        # Получаем зависимости
+        dependencies = self.repository.get_package_dependencies(start_package, start_version)
+        
+        for dep in dependencies:
+            self.graph[start_package].append(dep)
+            # Рекурсивный вызов для зависимостей
+            self.build_graph_bfs_recursive(
+                dep, "", max_depth, exclude_substring, 
+                current_depth + 1, current_path
+            )
+    
+    def get_graph(self):
+        """Получение построенного графа"""
+        return dict(self.graph)
+    
+    def get_cycles(self):
+        """Получение найденных циклических зависимостей"""
+        return self.cycles
+    
+    def reset(self):
+        """Сброс состояния графа"""
+        self.graph.clear()
+        self.visited.clear()
+        self.cycles.clear()
 
 def run_stage1(config_path):
     """Выполнение этапа 1"""
@@ -151,6 +237,65 @@ def run_stage2(config_path):
     
     return 0
 
+def run_stage3(config_path):
+    """Выполнение этапа 3"""
+    print("=== ЭТАП 3: ОСНОВНЫЕ ОПЕРАЦИИ ===")
+    
+    # 1. Чтение конфигурации
+    if not os.path.exists(config_path):
+        print(f"Ошибка: файл {config_path} не найден")
+        return 1
+    
+    config = configparser.ConfigParser()
+    try:
+        config.read(config_path)
+    except Exception as e:
+        print(f"Ошибка чтения конфигурации: {e}")
+        return 1
+    
+    if 'DEFAULT' not in config:
+        print("Ошибка: не найден раздел [DEFAULT]")
+        return 1
+    
+    config_dict = dict(config['DEFAULT'])
+    
+    # 2. Извлечение параметров
+    package = config_dict.get('package_name', 'serde')
+    repo_url = config_dict.get('repository_url', 'file://test_repo.txt')
+    version = config_dict.get('package_version', '1.0')
+    max_depth = int(config_dict.get('max_depth', 0)) or float('inf')
+    exclude_substring = config_dict.get('exclude_substring', '')
+    
+    print(f"Построение графа зависимостей для {package} версии {version}")
+    print(f"Максимальная глубина: {max_depth if max_depth != float('inf') else 'не ограничена'}")
+    if exclude_substring:
+        print(f"Исключаемая подстрока: '{exclude_substring}'")
+    
+    # 3. Построение графа
+    repo = CargoRepository(repo_url)
+    graph_builder = DependencyGraph(repo)
+    
+    graph_builder.build_graph_bfs_recursive(
+        package, version, max_depth, exclude_substring
+    )
+    
+    # 4. Вывод результатов
+    graph = graph_builder.get_graph()
+    cycles = graph_builder.get_cycles()
+    
+    print("\nПостроенный граф зависимостей:")
+    for pkg, deps in graph.items():
+        print(f"  {pkg} -> {', '.join(deps)}")
+    
+    if cycles:
+        print(f"\nОбнаружены циклические зависимости ({len(cycles)}):")
+        for i, cycle in enumerate(cycles, 1):
+            print(f"  Цикл {i}: {' -> '.join(cycle)}")
+    else:
+        print("\nЦиклические зависимости не обнаружены")
+    
+    return 0
+
 def main():
     parser = argparse.ArgumentParser(description='Визуализатор графа зависимостей')
     parser.add_argument('--config', required=True, help='Путь к INI-файлу конфигурации')
@@ -161,6 +306,8 @@ def main():
         return run_stage1(args.config)
     elif args.stage == 2:
         return run_stage2(args.config)
+    elif args.stage == 3:
+        return run_stage3(args.config)
     else:
         print(f"Этап {args.stage} еще не реализован")
         return 1
